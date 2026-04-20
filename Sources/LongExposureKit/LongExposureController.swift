@@ -27,7 +27,7 @@
 //      }
 //
 
-/  Controller is iOS/visionOS-only because it owns the camera pipeline.
+//  Controller is iOS/visionOS-only because it owns the camera pipeline.
 //  On other platforms, use LongExposureProcessor + FrameStabilizer directly
 //  with frames from any source.
 
