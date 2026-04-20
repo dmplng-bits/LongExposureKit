@@ -11,7 +11,7 @@ import AVFoundation
 
 public protocol CameraManagerDelegate: AnyObject {
     func cameraManager(_ manager: CameraManager,
-                       didOutput pixelBuffer: CVPixelBuffer,
+                       didOutput pixelBuffer: sending CVPixelBuffer,
                        timestamp: CMTime)
     func cameraManager(_ manager: CameraManager,
                        didFinishCaptureAfter frames: Int,
