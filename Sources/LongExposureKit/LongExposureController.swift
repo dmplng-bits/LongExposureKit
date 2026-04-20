@@ -166,7 +166,7 @@ public final class LongExposureController {
 
     // MARK: Delegate callbacks (invoked on main actor via the bridge)
 
-    fileprivate func handleFrame(_ pixelBuffer: CVPixelBuffer) {
+    fileprivate func handleFrame(_ pixelBuffer: sending CVPixelBuffer) {
         guard let processor = processor,
               let continuation = activeContinuation else { return }
 
@@ -224,7 +224,7 @@ private final class DelegateBridge: NSObject, CameraManagerDelegate {
     weak var owner: LongExposureController?
 
     func cameraManager(_ manager: CameraManager,
-                       didOutput pixelBuffer: CVPixelBuffer,
+                       didOutput pixelBuffer: sending CVPixelBuffer,
                        timestamp: CMTime) {
         // Retain the buffer across the hop — copying would be safer if you
         // see pool stalls, but for a handful of frames per second this is fine.
