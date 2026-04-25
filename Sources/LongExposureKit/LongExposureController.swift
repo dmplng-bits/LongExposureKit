@@ -60,13 +60,30 @@ public enum CaptureEvent: @unchecked Sendable {
     case started
     case progress(Double)              // 0...1
     case stabilizing                   // emitted once when alignment begins
+    case interrupted                   // session interrupted mid-capture
+    /// Periodic snapshot of the evolving long-exposure during capture.
+    /// Emitted at most every ~10 frames so the UI can show a developing
+    /// preview without thrashing.
+    case preview(UIImage)
     case finished(CaptureResult)
     case failed(Error)
 }
 
-public enum ControllerError: Error {
+public enum ControllerError: LocalizedError {
     case cameraAccessDenied
     case captureInProgress
+    case noFramesProduced
+
+    public var errorDescription: String? {
+        switch self {
+        case .cameraAccessDenied:
+            return "Camera access is required. Enable it in Settings."
+        case .captureInProgress:
+            return "A capture is already in progress."
+        case .noFramesProduced:
+            return "Capture finished without producing any frames."
+        }
+    }
 }
 
 @MainActor
@@ -120,31 +137,35 @@ public final class LongExposureController {
     ///
     /// Only one capture may be in flight at a time.
     public func capture(settings: CaptureSettings) -> AsyncStream<CaptureEvent> {
-        AsyncStream { continuation in
-            guard activeContinuation == nil else {
-                continuation.yield(.failed(ControllerError.captureInProgress))
-                continuation.finish()
-                return
-            }
+        // Using makeStream() instead of the closure-based AsyncStream init so
+        // we don't cross the @Sendable boundary when mutating @MainActor state.
+        let (stream, continuation) = AsyncStream<CaptureEvent>.makeStream()
 
-            self.processor           = LongExposureProcessor(mode: settings.blendMode)
-            self.stabilizer          = settings.stabilization.map(FrameStabilizer.init)
-            self.referenceBuffer     = nil
-            self.captureStartedAt    = Date()
-            self.currentDuration     = settings.duration
-            self.stabilizingEmitted  = false
-            self.activeContinuation  = continuation
-
-            continuation.onTermination = { [weak self] _ in
-                Task { @MainActor [weak self] in
-                    self?.camera.cancelCapture()
-                    self?.resetCaptureState()
-                }
-            }
-
-            continuation.yield(.started)
-            camera.beginCapture(seconds: settings.duration)
+        guard activeContinuation == nil else {
+            continuation.yield(.failed(ControllerError.captureInProgress))
+            continuation.finish()
+            return stream
         }
+
+        self.processor           = LongExposureProcessor(mode: settings.blendMode)
+        self.stabilizer          = settings.stabilization.map(FrameStabilizer.init)
+        self.referenceBuffer     = nil
+        self.captureStartedAt    = Date()
+        self.currentDuration     = settings.duration
+        self.stabilizingEmitted  = false
+        self.activeContinuation  = continuation
+
+        continuation.onTermination = { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.camera.cancelCapture()
+                self?.resetCaptureState()
+            }
+        }
+
+        continuation.yield(.started)
+        camera.beginCapture(seconds: settings.duration)
+
+        return stream
     }
 
     /// Cancel an in-progress capture. The stream will finish without a
@@ -184,6 +205,14 @@ public final class LongExposureController {
         }
         processor.add(pixelBuffer: pixelBuffer, transform: transform)
 
+        // Periodically emit the developing image as a preview so the UI can
+        // overlay it on the camera feed. Throttled to every 10th frame to
+        // avoid spending all our time rendering during capture.
+        if processor.frameCount % 10 == 0,
+           let preview = processor.renderUIImage() {
+            continuation.yield(.preview(preview))
+        }
+
         if let start = captureStartedAt {
             let p = min(1.0, Date().timeIntervalSince(start) / currentDuration)
             continuation.yield(.progress(p))
@@ -200,17 +229,19 @@ public final class LongExposureController {
                                        duration: duration)
             continuation.yield(.finished(result))
         } else {
-            continuation.yield(.failed(NSError(
-                domain: "LongExposureKit",
-                code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "No frames produced"]
-            )))
+            continuation.yield(.failed(ControllerError.noFramesProduced))
         }
         continuation.finish()
     }
 
     fileprivate func handleError(_ error: Error) {
         activeContinuation?.yield(.failed(error))
+        activeContinuation?.finish()
+        resetCaptureState()
+    }
+
+    fileprivate func handleInterruption() {
+        activeContinuation?.yield(.interrupted)
         activeContinuation?.finish()
         resetCaptureState()
     }
@@ -226,11 +257,10 @@ private final class DelegateBridge: NSObject, CameraManagerDelegate {
     func cameraManager(_ manager: CameraManager,
                        didOutput pixelBuffer: sending CVPixelBuffer,
                        timestamp: CMTime) {
-        // Retain the buffer across the hop — copying would be safer if you
-        // see pool stalls, but for a handful of frames per second this is fine.
-        let buffer = pixelBuffer
+        // `sending` transfers the buffer into the Task's isolation region,
+        // so the @MainActor hop is safe under Swift 6 strict concurrency.
         Task { @MainActor [weak owner] in
-            owner?.handleFrame(buffer)
+            owner?.handleFrame(pixelBuffer)
         }
     }
 
@@ -246,6 +276,13 @@ private final class DelegateBridge: NSObject, CameraManagerDelegate {
                        didEncounter error: Error) {
         Task { @MainActor [weak owner] in
             owner?.handleError(error)
+        }
+    }
+
+    func cameraManagerWasInterrupted(_ manager: CameraManager,
+                                     reason: AVCaptureSession.InterruptionReason?) {
+        Task { @MainActor [weak owner] in
+            owner?.handleInterruption()
         }
     }
 }

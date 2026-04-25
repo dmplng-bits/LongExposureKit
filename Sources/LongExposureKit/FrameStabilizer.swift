@@ -61,7 +61,9 @@ public final class FrameStabilizer {
                 return observation.alignmentTransform
             }
         } catch {
-            // Swallow — return identity, keep capturing.
+            LogChannel.stabilizer.debug(
+                "Translation registration failed: \(String(describing: error), privacy: .public)"
+            )
         }
         return .identity
     }
@@ -88,7 +90,9 @@ public final class FrameStabilizer {
                 )
             }
         } catch {
-            // Swallow — return identity, keep capturing.
+            LogChannel.stabilizer.debug(
+                "Homographic registration failed: \(String(describing: error), privacy: .public)"
+            )
         }
         return .identity
     }

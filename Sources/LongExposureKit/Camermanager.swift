@@ -1,5 +1,5 @@
 //
-//  Camermanager.swift
+//  CamerManager.swift
 //  LongExposureKit
 //
 //  Created by Preet Singh on 4/20/26.
@@ -10,6 +10,9 @@
 import AVFoundation
 
 public protocol CameraManagerDelegate: AnyObject {
+    /// Frames are passed via `sending` — ownership transfers from the video
+    /// queue's isolation region to the delegate. Required for Swift 6
+    /// region-based isolation when the delegate hops to a different actor.
     func cameraManager(_ manager: CameraManager,
                        didOutput pixelBuffer: sending CVPixelBuffer,
                        timestamp: CMTime)
@@ -18,12 +21,41 @@ public protocol CameraManagerDelegate: AnyObject {
                        duration: TimeInterval)
     func cameraManager(_ manager: CameraManager,
                        didEncounter error: Error)
+    /// Called when the AVCaptureSession is interrupted (phone call, app
+    /// backgrounded, screen lock, another app took the camera, etc.).
+    /// Any in-flight capture should be cancelled.
+    func cameraManagerWasInterrupted(_ manager: CameraManager,
+                                     reason: AVCaptureSession.InterruptionReason?)
+    /// Called when an interruption ends and the session can resume.
+    func cameraManagerInterruptionEnded(_ manager: CameraManager)
 }
 
-public enum CameraError: Error {
+// Default no-op implementations so the new methods don't break existing
+// conformers that only care about the original three callbacks.
+public extension CameraManagerDelegate {
+    func cameraManagerWasInterrupted(_ manager: CameraManager,
+                                     reason: AVCaptureSession.InterruptionReason?) {}
+    func cameraManagerInterruptionEnded(_ manager: CameraManager) {}
+}
+
+public enum CameraError: LocalizedError {
     case deviceUnavailable
     case cannotAddInput
     case cannotAddOutput
+    case runtimeError(String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .deviceUnavailable:
+            return "No back-facing camera was found on this device."
+        case .cannotAddInput:
+            return "The camera input could not be attached to the session."
+        case .cannotAddOutput:
+            return "The video output could not be attached to the session."
+        case .runtimeError(let message):
+            return "Camera runtime error: \(message)"
+        }
+    }
 }
 
 /// AVCaptureSession wrapper that streams BGRA frames to a delegate during
@@ -46,7 +78,14 @@ public final class CameraManager: NSObject {
     private var targetDuration: TimeInterval = 0
     private var framesCaptured = 0
 
-    public override init() { super.init() }
+    public override init() {
+        super.init()
+        subscribeToInterruptionNotifications()
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
 
     // MARK: Configuration
 
@@ -54,11 +93,70 @@ public final class CameraManager: NSObject {
         sessionQueue.async { [weak self] in self?.configureSession() }
     }
 
+    // MARK: Interruption handling
+
+    private func subscribeToInterruptionNotifications() {
+        let center = NotificationCenter.default
+        center.addObserver(
+            self,
+            selector: #selector(handleSessionInterruption(_:)),
+            name: AVCaptureSession.wasInterruptedNotification,
+            object: session
+        )
+        center.addObserver(
+            self,
+            selector: #selector(handleSessionInterruptionEnded(_:)),
+            name: AVCaptureSession.interruptionEndedNotification,
+            object: session
+        )
+        center.addObserver(
+            self,
+            selector: #selector(handleRuntimeError(_:)),
+            name: AVCaptureSession.runtimeErrorNotification,
+            object: session
+        )
+    }
+
+    @objc private func handleSessionInterruption(_ note: Notification) {
+        // Cancel any in-flight capture so partial results don't get delivered.
+        cancelCapture()
+
+        let reason: AVCaptureSession.InterruptionReason? = {
+            guard let raw = note.userInfo?[AVCaptureSessionInterruptionReasonKey] as? Int else {
+                return nil
+            }
+            return AVCaptureSession.InterruptionReason(rawValue: raw)
+        }()
+        delegate?.cameraManagerWasInterrupted(self, reason: reason)
+    }
+
+    @objc private func handleSessionInterruptionEnded(_ note: Notification) {
+        delegate?.cameraManagerInterruptionEnded(self)
+    }
+
+    @objc private func handleRuntimeError(_ note: Notification) {
+        cancelCapture()
+        let error = note.userInfo?[AVCaptureSessionErrorKey] as? Error
+            ?? CameraError.runtimeError("Unknown")
+        LogChannel.camera.error("Runtime error: \(String(describing: error), privacy: .public)")
+        delegate?.cameraManager(self, didEncounter: error)
+    }
+
     private func configureSession() {
         session.beginConfiguration()
         defer { session.commitConfiguration() }
 
-        session.sessionPreset = .photo
+        // .hd1920x1080 is the best preset for AVCaptureVideoDataOutput use.
+        // .photo (the old value) fights with video-data output pipelines on
+        // some devices, producing err=-17281 from FigCaptureSourceRemote.
+        // 1920x1080 is also more than enough resolution for long-exposure
+        // blending and uses far less memory per frame (~8MB vs ~48MB on
+        // 12MP sensors).
+        if session.canSetSessionPreset(.hd1920x1080) {
+            session.sessionPreset = .hd1920x1080
+        } else {
+            session.sessionPreset = .high
+        }
 
         guard let device = AVCaptureDevice.default(.builtInWideAngleCamera,
                                                    for: .video,
@@ -96,8 +194,10 @@ public final class CameraManager: NSObject {
         videoOutput = output
 
         if let connection = output.connection(with: .video) {
-            if connection.isVideoOrientationSupported {
-                connection.videoOrientation = .portrait
+            // iOS 17+ replacement for videoOrientation = .portrait.
+            // 90° = portrait for the back wide camera.
+            if connection.isVideoRotationAngleSupported(90) {
+                connection.videoRotationAngle = 90
             }
             if connection.isVideoStabilizationSupported {
                 connection.preferredVideoStabilizationMode = .off
@@ -144,6 +244,28 @@ public final class CameraManager: NSObject {
         device.exposureMode = .continuousAutoExposure
         device.focusMode = .continuousAutoFocus
         device.unlockForConfiguration()
+    }
+
+    /// Focus + expose at a normalized point in the device's coordinate space
+    /// (0,0 = top-left, 1,1 = bottom-right of the unrotated landscape sensor).
+    /// `AVCaptureVideoPreviewLayer.captureDevicePointConverted(fromLayerPoint:)`
+    /// handles the rotation/mirroring math from the preview's coordinates.
+    public func focusAndExpose(at devicePoint: CGPoint) throws {
+        guard let device = videoDevice else { return }
+        try device.lockForConfiguration()
+        defer { device.unlockForConfiguration() }
+
+        if device.isFocusPointOfInterestSupported,
+           device.isFocusModeSupported(.autoFocus) {
+            device.focusPointOfInterest = devicePoint
+            device.focusMode = .autoFocus
+        }
+        if device.isExposurePointOfInterestSupported,
+           device.isExposureModeSupported(.autoExpose) {
+            device.exposurePointOfInterest = devicePoint
+            device.exposureMode = .autoExpose
+        }
+        device.isSubjectAreaChangeMonitoringEnabled = true
     }
 
     // MARK: Capture window

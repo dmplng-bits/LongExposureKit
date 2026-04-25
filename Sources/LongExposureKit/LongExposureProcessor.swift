@@ -46,7 +46,23 @@ public final class LongExposureProcessor {
 
     public init(mode: BlendMode, ciContext: CIContext? = nil) {
         self.mode = mode
-        self.ciContext = ciContext ?? CIContext(options: [.useSoftwareRenderer: false])
+        self.ciContext = ciContext ?? Self.makeDefaultContext()
+    }
+
+    /// Default CI context that uses float-precision intermediate buffers.
+    /// This matters hugely for `.mean`: 8-bit intermediates compound rounding
+    /// errors over long captures (80+ frames), drifting the running mean
+    /// toward white. Using `RGBAf` + extended linear sRGB keeps the math
+    /// accurate all the way to the final render.
+    private static func makeDefaultContext() -> CIContext {
+        var options: [CIContextOption: Any] = [
+            .useSoftwareRenderer: false,
+            .workingFormat: CIFormat.RGBAh        // 16-bit float per channel
+        ]
+        if let linear = CGColorSpace(name: CGColorSpace.extendedLinearSRGB) {
+            options[.workingColorSpace] = linear
+        }
+        return CIContext(options: options)
     }
 
     /// Add a frame to the running blend.
@@ -95,17 +111,14 @@ public final class LongExposureProcessor {
     }
 
     #if canImport(UIKit)
-    /// Convenience for iOS/tvOS/visionOS/watchOS apps.
+    /// Convenience for iOS/tvOS/visionOS apps.
+    /// Scale is 1 because the image is destined for disk/export, not
+    /// per-pixel rendering at the device's native scale. (Also avoids
+    /// `UIScreen.main`, which is deprecated on iOS 16+ and unavailable
+    /// on visionOS.)
     public func renderUIImage() -> UIImage? {
         guard let cg = renderCGImage() else { return nil }
-        let scale: CGFloat = {
-            #if os(iOS) || os(tvOS) || os(visionOS)
-            return UIScreen.main.scale
-            #else
-            return 1
-            #endif
-        }()
-        return UIImage(cgImage: cg, scale: scale, orientation: .up)
+        return UIImage(cgImage: cg, scale: 1, orientation: .up)
     }
     #endif
 
