@@ -23,7 +23,6 @@ exist.
 explicit minimum — it inherits from the app that consumes it. The
 code uses `AsyncStream`, `@MainActor`, and structured concurrency,
 so the effective floor is iOS 15 / macOS 12 / tvOS 15 / visionOS 1.
-The Chira app itself requires iOS 17 (for SwiftData).
 
 > watchOS is not supported — the Vision framework isn't available
 > there. If you need to build for watchOS, the Vision imports in
